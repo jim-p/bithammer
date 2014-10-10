@@ -5,7 +5,9 @@ import logging
 import datetime
 import time
 import os
+import pipes
 import warnings
+import optparse
 
 import lpd
 from hashutils import bintohex
@@ -34,6 +36,8 @@ class BitHammer:
 
         # Network info
         self.interface    = conf.iface
+        self.mode         = "arp" # arp = classic ARP poisoning, block_pf - adds to a pf table
+        self.mode_data    = "virusprot" # for block_pf, the table name for blocked hosts
         self.network      = None
         self.gateway      = None  # Gateway IP
         self.gateway_hw   = None  # Gateway MAC
@@ -71,10 +75,26 @@ class BitHammer:
         if self.gateway is not None and self.network is not None:
             if self.VERBOSITY > 2:
                 print "Gateway is %s on network %s at interface %s." % ( self.gateway, self.network, self.interface )
-        else:
-          raise Exception( "Error: network gateway not found." )
+        elif self.mode == "arp":
+            raise Exception( "Error: network gateway not found." )
 
     def loadSettings(self):
+
+        parser = optparse.OptionParser()
+        parser.add_option('-v', '--verbose',   action="store", dest="verbose",   default=2,           help='Amount of verbosity')
+        parser.add_option('-i', '--iface',     action="store", dest="iface",     default=conf.iface,  help='Interface for binding')
+        parser.add_option('-m', '--mode',      action="store", dest="mode",      default="arp",       help='Mode to use:  arp=ARP Poisoning, block_pf=Block using a pf table')
+        parser.add_option('-d', '--mode_data', action="store", dest="mode_data", default="virusprot", help='Data for the mode. For block_pf, this specifies the table name.')
+        (opts, args) = parser.parse_args()
+        if opts.iface:
+            self.iface = opts.iface
+        if opts.mode:
+            self.mode = opts.mode
+        if opts.mode_data:
+            self.mode_data = opts.mode_data
+        if opts.verbose:
+            self.VERBOSITY = opts.verbose
+
         self.ips = []
         self.macs = []
 
@@ -88,7 +108,7 @@ class BitHammer:
     def ipSearcher(self):
 
         if self.VERBOSITY > 2:
-            print('- Searching for Bittorrent IPs...')
+            print('- Searching for Bittorrent IPs on interface %s...') % (self.iface)
 
         # Continiously accept LDP broadcasts
         s = lpd.LPDSocket()
@@ -161,19 +181,39 @@ class BitHammer:
                 sendp( Ether( dst = self.gateway_hw ) / ARP( op = "who-has", psrc = ip,           pdst = self.gateway ), iface_hint = self.gateway )
                 sendp( Ether( dst = mac )             / ARP( op = "who-has", psrc = self.gateway, pdst = ip ),           iface_hint = self.gateway )
 
+    def ipBlockerPF(self):
+        if self.VERBOSITY > 2:
+            print('# Banning IP addresses in background thread to pf table %s.' % (self.mode_data) )
+        while self.running:
+            time.sleep(self.DELAY)
+            # Poison in both directions
+            #   gateway -> us -> target
+            #   target  -> us -> gateway
+            for (ip) in self.ips:
+                if self.VERBOSITY > 3:
+                    print('# blocking {}'.format(ip))
+                os.system("/sbin/pfctl -T add -t " + pipes.quote(self.mode_data) + " " + pipes.quote(ip) )
+            self.ips = []
+
     def hammer(self):
 
         self.threadSearch = threading.Thread(target=self.ipSearcher)
         self.threadSearch.daemon = True
         self.threadSearch.start()
 
-        self.threadResolve = threading.Thread(target=self.ipResolver)
-        self.threadResolve.daemon = True
-        self.threadResolve.start()
+        if self.mode == "arp":
+            self.threadResolve = threading.Thread(target=self.ipResolver)
+            self.threadResolve.daemon = True
+            self.threadResolve.start()
 
-        self.threadPoison = threading.Thread(target=self.aprPoisoner)
-        self.threadPoison.daemon = True
-        self.threadPoison.start()
+            self.threadPoison = threading.Thread(target=self.aprPoisoner)
+            self.threadPoison.daemon = True
+            self.threadPoison.start()
+
+        if self.mode == "block_pf":
+            self.threadBlock = threading.Thread(target=self.ipBlockerPF)
+            self.threadBlock.daemon = True
+            self.threadBlock.start()
 
         while True:
             time.sleep(self.DELAY)
@@ -182,6 +222,6 @@ class BitHammer:
 if __name__ == '__main__':
 
     bh = BitHammer()
-
     bh.loadSettings()
+
     bh.hammer()
