@@ -36,8 +36,10 @@ class BitHammer:
 
         # Network info
         self.interface    = conf.iface
-        self.mode         = "arp" # arp = classic ARP poisoning, block_pf - adds to a pf table
-        self.mode_data    = "virusprot" # for block_pf, the table name for blocked hosts
+        self.all_modes    = ['arp', 'block_ip', 'block_mac']
+        self.mode         = "arp" # arp = classic ARP poisoning, block_ip - adds to a pf table
+        self.command      = "/sbin/pfctl" # for block_ip, the table name for blocked hosts
+        self.command_args = "-T add -t virusprot %s" # for block_ip, the table name for blocked hosts
         self.network      = None
         self.gateway      = None  # Gateway IP
         self.gateway_hw   = None  # Gateway MAC
@@ -81,18 +83,33 @@ class BitHammer:
     def loadSettings(self):
 
         parser = optparse.OptionParser()
-        parser.add_option('-v', '--verbose',   action="store", dest="verbose",   default=2,           help='Amount of verbosity')
-        parser.add_option('-i', '--iface',     action="store", dest="iface",     default=conf.iface,  help='Interface for binding')
-        parser.add_option('-m', '--mode',      action="store", dest="mode",      default="arp",       help='Mode to use:  arp=ARP Poisoning, block_pf=Block using a pf table')
-        parser.add_option('-d', '--mode_data', action="store", dest="mode_data", default="virusprot", help='Data for the mode. For block_pf, this specifies the table name.')
+        parser.add_option('-v', '--verbose',        action="store", dest="verbose",      default=2,                        help='Amount of verbosity')
+        parser.add_option('-i', '--iface',          action="store", dest="iface",        default=conf.iface,               help='Interface for binding')
+        parser.add_option('-m', '--mode',           action="store", dest="mode",         default="arp",                    help='Mode to use:  arp=ARP Poisoning, block_ip=Block by IP using a command, block_mac=Block by IP using a command')
+        parser.add_option('-c', '--command',        action="store", dest="command",      default="/sbin/pfctl",            help='Command to run to block by IP/MAC.')
+        parser.add_option('-a', '--command_args',   action="store", dest="command_args", default="-T add -t virusprot %s", help='Arguments to pass to command to run to block by IP/MAC.')
         (opts, args) = parser.parse_args()
+
         if opts.iface:
-            self.iface = opts.iface
+            # Not ideal, but pre python 3.3 there is no portable way to get an interface list to verify.
+            self.iface = os.path.basename(opts.iface)
+
         if opts.mode:
+            if opts.mode not in self.all_modes:
+                raise Exception( "Error: Supplied mode is invalid." )
             self.mode = opts.mode
-        if opts.mode_data:
-            self.mode_data = opts.mode_data
+
+        if opts.command:
+            if not os.path.isfile(self.command):
+                raise Exception( "Error: Supplied command does not exist (add arguments in -a)." )
+            self.command = opts.command
+
+        if opts.command:
+            self.command_args = opts.command_args
+
         if opts.verbose:
+            if (int(opts.verbose) < 0) or (int(opts.verbose) > 4):
+                raise Exception( "Error: Supplied verbosity level is invalid." )
             self.VERBOSITY = opts.verbose
 
         self.ips = []
@@ -181,18 +198,26 @@ class BitHammer:
                 sendp( Ether( dst = self.gateway_hw ) / ARP( op = "who-has", psrc = ip,           pdst = self.gateway ), iface_hint = self.gateway )
                 sendp( Ether( dst = mac )             / ARP( op = "who-has", psrc = self.gateway, pdst = ip ),           iface_hint = self.gateway )
 
-    def ipBlockerPF(self):
+    def ipBlocker(self):
         if self.VERBOSITY > 2:
-            print('# Banning IP addresses in background thread to pf table %s.' % (self.mode_data) )
+            print('# Banning IP addresses in background thread using command: %s %s' % (self.command, self.command_args) )
         while self.running:
             time.sleep(self.DELAY)
-            # Poison in both directions
-            #   gateway -> us -> target
-            #   target  -> us -> gateway
             for (ip) in self.ips:
                 if self.VERBOSITY > 3:
-                    print('# blocking {}'.format(ip))
-                os.system("/sbin/pfctl -T add -t " + pipes.quote(self.mode_data) + " " + pipes.quote(ip) )
+                    print('# Blocking IP Address: {}'.format(ip))
+                os.system(self.command + ' ' + self.command_args % (pipes.quote(ip)))
+            self.ips = []
+
+    def macBlocker(self):
+        if self.VERBOSITY > 2:
+            print('# Banning MAC addresses in background thread using command: %s %s' % (self.command, self.command_args) )
+        while self.running:
+            time.sleep(self.DELAY)
+            for (mac, ip) in self.macs:
+                if self.VERBOSITY > 3:
+                    print('# Blocking MAC Address: {}'.format(mac))
+                os.system(self.command + ' ' + self.command_args % (pipes.quote(mac)))
             self.ips = []
 
     def hammer(self):
@@ -210,8 +235,17 @@ class BitHammer:
             self.threadPoison.daemon = True
             self.threadPoison.start()
 
-        if self.mode == "block_pf":
-            self.threadBlock = threading.Thread(target=self.ipBlockerPF)
+        if self.mode == "block_ip":
+            self.threadBlock = threading.Thread(target=self.ipBlocker)
+            self.threadBlock.daemon = True
+            self.threadBlock.start()
+
+        if self.mode == "block_mac":
+            self.threadResolve = threading.Thread(target=self.ipResolver)
+            self.threadResolve.daemon = True
+            self.threadResolve.start()
+
+            self.threadBlock = threading.Thread(target=self.macBlocker)
             self.threadBlock.daemon = True
             self.threadBlock.start()
 
